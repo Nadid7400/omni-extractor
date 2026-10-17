@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: omni-extractor
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: PORT
+        value: 8000
