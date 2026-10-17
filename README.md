@@ -6,6 +6,8 @@ A small FastAPI + yt-dlp web app for inspecting and downloading **publicly acces
 
 There is no cookie upload, cookie file, cookie environment variable, proxy configuration, sign-in session, or browser credential handling in this app. It makes ordinary unauthenticated yt-dlp requests. That means public links work where the source platform permits them, but **no downloader can promise every platform/video will work without authorization**. YouTube and other services may block datacenter requests, require sign-in, or apply bot verification; this app will report the error rather than bypass those checks. Private, age-restricted, or otherwise gated media is not supported.
 
+YouTube extraction (and some other sites) uses a JavaScript runtime; the Docker image bundles Deno for this. Optionally, `YTDLP_EXTRACTOR_ARGS` can tune yt-dlp extractor behavior on a deployment, e.g. `youtube:player_client=android_vr,tv,ios` to try different YouTube clients.
+
 ## Run locally
 
 ```bash

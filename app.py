@@ -52,6 +52,21 @@ def validate_public_url(raw_url: str) -> str:
     return raw_url.strip()
 
 
+def parse_extractor_args(raw: str) -> dict[str, dict[str, list[str]]]:
+    """Parse 'extractor:key=value,...;extractor2:key2=v1,v2' into yt-dlp extractor_args."""
+    parsed: dict[str, dict[str, list[str]]] = {}
+    for chunk in raw.split(";"):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk or "=" not in chunk:
+            continue
+        extractor, rest = chunk.split(":", 1)
+        key, value = rest.split("=", 1)
+        values = [item.strip() for item in value.split(",") if item.strip()]
+        if extractor.strip() and key.strip() and values:
+            parsed.setdefault(extractor.strip(), {})[key.strip()] = values
+    return parsed
+
+
 def ydl_options(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
@@ -63,6 +78,9 @@ def ydl_options(extra: dict[str, Any] | None = None) -> dict[str, Any]:
         "extractor_retries": 1,
         "cachedir": False,
     }
+    extractor_args = parse_extractor_args(os.getenv("YTDLP_EXTRACTOR_ARGS", ""))
+    if extractor_args:
+        opts["extractor_args"] = extractor_args
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
     if extra:
