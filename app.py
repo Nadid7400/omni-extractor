@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import os
 import re
@@ -15,7 +16,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 import yt_dlp
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
@@ -45,6 +46,28 @@ MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
 MAX_QUEUED_JOBS = max(1, int(os.getenv("MAX_QUEUED_JOBS", "20")))
 _JOB_SLOTS = threading.Semaphore(MAX_CONCURRENT_JOBS)
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+
+# Optional account linking. Users may supply their own YouTube/Google cookies so
+# yt-dlp downloads run as their signed-in session (YouTube is unusable from
+# datacenter IPs without one). Cookies are held in memory only, keyed by a
+# session cookie, and are written to a short-lived temp file per job that is
+# removed as soon as the job ends.
+LINKED_ACCOUNTS: dict[str, dict[str, Any]] = {}
+ACCOUNT_LOCK = threading.Lock()
+ACCOUNT_TTL_SECONDS = 2 * 60 * 60
+MAX_LINKED_ACCOUNTS = 1000
+MAX_COOKIE_BYTES = 256 * 1024
+COOKIE_DOMAINS = (
+    "youtube.com",
+    "youtu.be",
+    "googlevideo.com",
+    "ytimg.com",
+    "google.com",
+    "googleusercontent.com",
+    "gstatic.com",
+    "google.co",
+)
+SESSION_COOKIE_NAME = "omni_session"
 
 
 def _job_sweep() -> None:
@@ -78,6 +101,81 @@ def _progress_hook(job_id: str) -> Callable[[dict[str, Any]], None]:
         elif status == "finished":
             _update_job(job_id, stage="processing", downloaded=data.get("total_bytes"), total=data.get("total_bytes"))
     return hook
+
+
+def _account_sweep() -> None:
+    now = time.time()
+    with ACCOUNT_LOCK:
+        stale = [token for token, acct in LINKED_ACCOUNTS.items() if now - acct["updated"] > ACCOUNT_TTL_SECONDS]
+        for token in stale:
+            LINKED_ACCOUNTS.pop(token, None)
+
+
+def account_cookie_blob(token: str | None) -> str | None:
+    if not token:
+        return None
+    now = time.time()
+    with ACCOUNT_LOCK:
+        acct = LINKED_ACCOUNTS.get(token)
+        if not acct:
+            return None
+        if now - acct["updated"] > ACCOUNT_TTL_SECONDS:
+            LINKED_ACCOUNTS.pop(token, None)
+            return None
+        acct["updated"] = now
+        return acct["cookies"]
+
+
+@contextlib.contextmanager
+def linked_cookiefile(token: str | None):
+    """Yield a temporary cookiefile for the linked session, or None when not linked."""
+    blob = account_cookie_blob(token)
+    if not blob:
+        yield None
+        return
+    handle_fd, path = tempfile.mkstemp(prefix="omni-cookies-", suffix=".txt")
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(blob)
+        yield path
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+
+def request_is_https(http_request: Request) -> bool:
+    """Honor X-Forwarded-Proto (Render/most proxies) so cookie flags match the real scheme."""
+    forwarded = http_request.headers.get("x-forwarded-proto", "")
+    scheme = forwarded.split(",")[0].strip().lower() or http_request.url.scheme
+    return scheme == "https"
+
+
+def validate_cookie_blob(raw: str) -> tuple[str, int]:
+    """Keep only youtube/google cookie lines from an exported Netscape cookies.txt."""
+    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip().lstrip("\ufeff")
+    if not text:
+        raise HTTPException(status_code=400, detail="Paste the contents of a cookies.txt file exported for youtube.com.")
+    if len(text) > MAX_COOKIE_BYTES:
+        raise HTTPException(status_code=400, detail="That cookies file is too large.")
+    kept: list[str] = []
+    for line in text.split("\n"):
+        line = line.rstrip()
+        if not line:
+            continue
+        probe = line[len("#HttpOnly_"):] if line.startswith("#HttpOnly_") else line
+        if probe.startswith("#"):
+            continue
+        parts = probe.split("\t")
+        if len(parts) < 7:
+            continue
+        domain = parts[0].lstrip(".").lower()
+        if not any(domain == allowed or domain.endswith("." + allowed) for allowed in COOKIE_DOMAINS):
+            continue
+        kept.append(line)
+    if not kept:
+        raise HTTPException(status_code=400, detail="No youtube.com or google.com cookies were found in that file.")
+    blob = "# Netscape HTTP Cookie File\n" + "\n".join(kept) + "\n"
+    return blob, len(kept)
 
 
 def validate_public_url(raw_url: str) -> str:
@@ -181,8 +279,9 @@ def clean_metadata(info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def extract_info(raw_url: str) -> dict[str, Any]:
-    with yt_dlp.YoutubeDL(ydl_options()) as ydl:
+def extract_info(raw_url: str, cookiefile: str | None = None) -> dict[str, Any]:
+    extra = {"cookiefile": cookiefile} if cookiefile else None
+    with yt_dlp.YoutubeDL(ydl_options(extra)) as ydl:
         info = ydl.extract_info(raw_url, download=False)
         if not info:
             raise RuntimeError("No media information was returned.")
@@ -197,23 +296,76 @@ class BatchRequest(BaseModel):
     text: str
 
 
+class LinkCookiesRequest(BaseModel):
+    cookies: str
+
+
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     return {"status": "ok", "ffmpeg": bool(FFMPEG_LOCATION)}
 
 
 @app.get("/api/info")
-async def info_get(url: str = Query(..., min_length=8, max_length=2048)) -> dict[str, Any]:
+async def info_get(http_request: Request, url: str = Query(..., min_length=8, max_length=2048)) -> dict[str, Any]:
     safe_url = validate_public_url(url)
+    token = http_request.cookies.get(SESSION_COOKIE_NAME)
     try:
-        return await run_in_threadpool(extract_info, safe_url)
+        with linked_cookiefile(token) as cookiefile:
+            return await run_in_threadpool(extract_info, safe_url, cookiefile)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not read this media URL: {str(exc)[:240]}")
 
 
 @app.post("/api/info")
-async def info_post(request: InfoRequest) -> dict[str, Any]:
-    return await info_get(request.url)
+async def info_post(http_request: Request, payload: InfoRequest) -> dict[str, Any]:
+    return await info_get(http_request, payload.url)
+
+
+@app.get("/api/account")
+async def account_info(http_request: Request) -> dict[str, Any]:
+    _account_sweep()
+    token = http_request.cookies.get(SESSION_COOKIE_NAME)
+    blob = account_cookie_blob(token)
+    if not blob:
+        return {"linked": False}
+    with ACCOUNT_LOCK:
+        acct = LINKED_ACCOUNTS.get(token) or {}
+        entries = acct.get("entries")
+    return {"linked": True, "entries": entries, "expires_in": ACCOUNT_TTL_SECONDS}
+
+
+@app.post("/api/account/link")
+async def account_link(http_request: Request, payload: LinkCookiesRequest, response: Response) -> dict[str, Any]:
+    blob, entries = validate_cookie_blob(payload.cookies)
+    token = http_request.cookies.get(SESSION_COOKIE_NAME) or uuid.uuid4().hex
+    _account_sweep()
+    with ACCOUNT_LOCK:
+        if token not in LINKED_ACCOUNTS and len(LINKED_ACCOUNTS) >= MAX_LINKED_ACCOUNTS:
+            oldest = min(LINKED_ACCOUNTS, key=lambda key: LINKED_ACCOUNTS[key]["updated"])
+            LINKED_ACCOUNTS.pop(oldest, None)
+        LINKED_ACCOUNTS[token] = {"cookies": blob, "entries": entries, "updated": time.time()}
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        token,
+        max_age=ACCOUNT_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=request_is_https(http_request),
+        path="/",
+    )
+    return {"linked": True, "entries": entries, "expires_in": ACCOUNT_TTL_SECONDS}
+
+
+@app.post("/api/account/unlink")
+async def account_unlink(http_request: Request, response: Response) -> dict[str, Any]:
+    token = http_request.cookies.get(SESSION_COOKIE_NAME)
+    if token:
+        with ACCOUNT_LOCK:
+            LINKED_ACCOUNTS.pop(token, None)
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/", secure=request_is_https(http_request), httponly=True, samesite="lax")
+    return {"linked": False}
 
 
 def safe_filename(value: str) -> str:
@@ -248,12 +400,15 @@ def build_download_options(
     format: str,
     bitrate: int,
     progress_hook: Callable[[dict[str, Any]], None] | None = None,
+    cookiefile: str | None = None,
 ) -> dict[str, Any]:
     options: dict[str, Any] = {
         "outtmpl": os.path.join(tempdir, "%(title).150B.%(ext)s"),
         "restrictfilenames": True,
         "overwrites": True,
     }
+    if cookiefile:
+        options["cookiefile"] = cookiefile
     if type == "video":
         if quality == "best":
             options["format"] = "bestvideo+bestaudio/best"
@@ -289,6 +444,7 @@ def download_error_message(exc: Exception, type: str) -> str:
 
 @app.get("/api/download")
 async def download(
+    http_request: Request,
     url: str = Query(..., min_length=8, max_length=2048),
     type: str = Query("video", pattern="^(video|audio)$"),
     quality: str = Query("best", max_length=8),
@@ -300,10 +456,11 @@ async def download(
     validate_download_args(type, quality, format)
 
     tempdir = tempfile.mkdtemp(prefix="omni-")
-    options = build_download_options(tempdir, type, quality, format, bitrate)
 
     try:
-        await run_in_threadpool(lambda: _download_sync(safe_url, options))
+        with linked_cookiefile(http_request.cookies.get(SESSION_COOKIE_NAME)) as cookiefile:
+            options = build_download_options(tempdir, type, quality, format, bitrate, cookiefile=cookiefile)
+            await run_in_threadpool(lambda: _download_sync(safe_url, options))
         path, _ = finish_download(tempdir, type, format, title)
         return FileResponse(
             path,
@@ -321,12 +478,23 @@ async def download(
         raise HTTPException(status_code=422, detail=f"Download failed: {download_error_message(exc, type)}")
 
 
-def _run_download_job(job_id: str, safe_url: str, type: str, quality: str, format: str, bitrate: int, title: str | None, tempdir: str) -> None:
+def _run_download_job(
+    job_id: str,
+    safe_url: str,
+    type: str,
+    quality: str,
+    format: str,
+    bitrate: int,
+    title: str | None,
+    tempdir: str,
+    session_token: str | None,
+) -> None:
     with _JOB_SLOTS:
         _update_job(job_id, status="working", stage="downloading")
-        options = build_download_options(tempdir, type, quality, format, bitrate, _progress_hook(job_id))
         try:
-            _download_sync(safe_url, options)
+            with linked_cookiefile(session_token) as cookiefile:
+                options = build_download_options(tempdir, type, quality, format, bitrate, _progress_hook(job_id), cookiefile)
+                _download_sync(safe_url, options)
             path, size = finish_download(tempdir, type, format, title)
             _update_job(job_id, status="done", stage="done", path=str(path), filename=path.name, size=size, tempdir=tempdir)
         except Exception as exc:
@@ -339,6 +507,7 @@ JOB_PUBLIC_FIELDS = ("status", "stage", "error", "filename", "size", "downloaded
 
 @app.post("/api/download-job")
 async def download_job(
+    http_request: Request,
     url: str = Query(..., min_length=8, max_length=2048),
     type: str = Query("video", pattern="^(video|audio)$"),
     quality: str = Query("best", max_length=8),
@@ -349,6 +518,7 @@ async def download_job(
     safe_url = validate_public_url(url)
     validate_download_args(type, quality, format)
     _job_sweep()
+    session_token = http_request.cookies.get(SESSION_COOKIE_NAME)
 
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
@@ -371,7 +541,9 @@ async def download_job(
             "created": time.time(),
             "updated": time.time(),
         }
-    task = asyncio.create_task(run_in_threadpool(_run_download_job, job_id, safe_url, type, quality, format, bitrate, title, tempdir))
+    task = asyncio.create_task(
+        run_in_threadpool(_run_download_job, job_id, safe_url, type, quality, format, bitrate, title, tempdir, session_token)
+    )
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
     return {"job_id": job_id, "queued_ahead": queued_ahead}
@@ -438,17 +610,19 @@ def _download_sync(url: str, options: dict[str, Any]) -> None:
 
 
 @app.post("/api/extract-batch")
-async def extract_batch(request: BatchRequest) -> dict[str, Any]:
-    urls = re.findall(r'https?://[^\s<>"\']+', request.text)
+async def extract_batch(http_request: Request, payload: BatchRequest) -> dict[str, Any]:
+    urls = re.findall(r'https?://[^\s<>"\']+', payload.text)
     urls = list(dict.fromkeys(u.rstrip(".,);]") for u in urls))[:10]
     results = []
-    for url in urls:
-        try:
-            safe_url = validate_public_url(url)
-            data = await run_in_threadpool(extract_info, safe_url)
-            results.append({"url": url, "ok": True, "data": data})
-        except Exception as exc:
-            results.append({"url": url, "ok": False, "error": str(exc)[:200]})
+    token = http_request.cookies.get(SESSION_COOKIE_NAME)
+    with linked_cookiefile(token) as cookiefile:
+        for url in urls:
+            try:
+                safe_url = validate_public_url(url)
+                data = await run_in_threadpool(extract_info, safe_url, cookiefile)
+                results.append({"url": url, "ok": True, "data": data})
+            except Exception as exc:
+                results.append({"url": url, "ok": False, "error": str(exc)[:200]})
     return {"results": results, "count": len(results), "limit": 10}
 
 
