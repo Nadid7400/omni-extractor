@@ -42,6 +42,7 @@ DOWNLOAD_JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 JOB_TTL_SECONDS = 30 * 60
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
+MAX_QUEUED_JOBS = max(1, int(os.getenv("MAX_QUEUED_JOBS", "20")))
 _JOB_SLOTS = threading.Semaphore(MAX_CONCURRENT_JOBS)
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 
@@ -349,10 +350,12 @@ async def download_job(
     validate_download_args(type, quality, format)
     _job_sweep()
 
-    tempdir = tempfile.mkdtemp(prefix="omni-")
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
         queued_ahead = sum(1 for job in DOWNLOAD_JOBS.values() if job["status"] in {"queued", "working"})
+        if queued_ahead >= MAX_QUEUED_JOBS:
+            raise HTTPException(status_code=429, detail="The download queue is full — try again in a minute.")
+        tempdir = tempfile.mkdtemp(prefix="omni-")
         DOWNLOAD_JOBS[job_id] = {
             "id": job_id,
             "status": "queued",
