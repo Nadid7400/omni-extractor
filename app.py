@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import ipaddress
+import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -17,7 +22,7 @@ from urllib.parse import urlparse
 
 import yt_dlp
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
@@ -69,6 +74,18 @@ COOKIE_DOMAINS = (
 )
 SESSION_COOKIE_NAME = "omni_session"
 
+# Google Sign-In (OpenID Connect authorization-code flow). This authenticates the
+# visitor's Google identity only: it returns an id_token for profile/email, and
+# deliberately never requests YouTube scopes, because no Google OAuth scope can
+# authorize media downloads (yt-dlp needs the account's browser session, which
+# account linking above provides). Disabled unless credentials are configured.
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
+OAUTH_STATE_COOKIE = "omni_oauth_state"
+
 
 def _job_sweep() -> None:
     now = time.time()
@@ -111,7 +128,7 @@ def _account_sweep() -> None:
             LINKED_ACCOUNTS.pop(token, None)
 
 
-def account_cookie_blob(token: str | None) -> str | None:
+def get_session(token: str | None) -> dict[str, Any] | None:
     if not token:
         return None
     now = time.time()
@@ -123,7 +140,87 @@ def account_cookie_blob(token: str | None) -> str | None:
             LINKED_ACCOUNTS.pop(token, None)
             return None
         acct["updated"] = now
-        return acct["cookies"]
+        return dict(acct)
+
+
+def update_session(token: str, **fields: Any) -> None:
+    now = time.time()
+    with ACCOUNT_LOCK:
+        acct = LINKED_ACCOUNTS.get(token)
+        if acct is None:
+            acct = {"cookies": None, "entries": 0, "identity": None}
+            LINKED_ACCOUNTS[token] = acct
+        acct.update(fields)
+        acct["updated"] = now
+
+
+def account_cookie_blob(token: str | None) -> str | None:
+    session = get_session(token)
+    return session.get("cookies") if session else None
+
+
+def google_auth_configured() -> bool:
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+
+
+def public_base_url(http_request: Request) -> str:
+    override = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
+    if override:
+        return override
+    host = http_request.headers.get("host") or http_request.url.netloc
+    scheme = "https" if request_is_https(http_request) else "http"
+    return f"{scheme}://{host}"
+
+
+def google_authorize_url(redirect_uri: str, state: str) -> str:
+    query = urllib.parse.urlencode(
+        {
+            "client_id": GOOGLE_CLIENT_ID,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "state": state,
+            "prompt": "select_account",
+            "access_type": "online",
+        }
+    )
+    return f"{GOOGLE_AUTH_ENDPOINT}?{query}"
+
+
+def exchange_google_code(code: str, redirect_uri: str) -> dict[str, Any]:
+    payload = urllib.parse.urlencode(
+        {
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        }
+    ).encode()
+    request = urllib.request.Request(
+        GOOGLE_TOKEN_ENDPOINT,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def parse_google_id_token(id_token: str) -> dict[str, Any]:
+    """Decode and sanity-check the id_token Google returned to our token endpoint over TLS."""
+    try:
+        payload_segment = id_token.split(".")[1]
+        padded = payload_segment + "=" * (-len(payload_segment) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except Exception:
+        raise ValueError("Could not read the Google response.")
+    if claims.get("aud") != GOOGLE_CLIENT_ID:
+        raise ValueError("That Google token was issued for a different application.")
+    if claims.get("iss") not in GOOGLE_ISSUERS:
+        raise ValueError("Unexpected Google token issuer.")
+    if float(claims.get("exp", 0)) < time.time():
+        raise ValueError("The Google sign-in had already expired.")
+    return claims
 
 
 @contextlib.contextmanager
@@ -327,13 +424,16 @@ async def info_post(http_request: Request, payload: InfoRequest) -> dict[str, An
 async def account_info(http_request: Request) -> dict[str, Any]:
     _account_sweep()
     token = http_request.cookies.get(SESSION_COOKIE_NAME)
-    blob = account_cookie_blob(token)
-    if not blob:
-        return {"linked": False}
-    with ACCOUNT_LOCK:
-        acct = LINKED_ACCOUNTS.get(token) or {}
-        entries = acct.get("entries")
-    return {"linked": True, "entries": entries, "expires_in": ACCOUNT_TTL_SECONDS}
+    session = get_session(token)
+    if not session:
+        return {"linked": False, "identity": None, "google": google_auth_configured()}
+    return {
+        "linked": bool(session.get("cookies")),
+        "entries": session.get("entries") or 0,
+        "identity": session.get("identity"),
+        "expires_in": ACCOUNT_TTL_SECONDS,
+        "google": google_auth_configured(),
+    }
 
 
 @app.post("/api/account/link")
@@ -345,7 +445,7 @@ async def account_link(http_request: Request, payload: LinkCookiesRequest, respo
         if token not in LINKED_ACCOUNTS and len(LINKED_ACCOUNTS) >= MAX_LINKED_ACCOUNTS:
             oldest = min(LINKED_ACCOUNTS, key=lambda key: LINKED_ACCOUNTS[key]["updated"])
             LINKED_ACCOUNTS.pop(oldest, None)
-        LINKED_ACCOUNTS[token] = {"cookies": blob, "entries": entries, "updated": time.time()}
+    update_session(token, cookies=blob, entries=entries)
     response.set_cookie(
         SESSION_COOKIE_NAME,
         token,
@@ -366,6 +466,88 @@ async def account_unlink(http_request: Request, response: Response) -> dict[str,
             LINKED_ACCOUNTS.pop(token, None)
     response.delete_cookie(SESSION_COOKIE_NAME, path="/", secure=request_is_https(http_request), httponly=True, samesite="lax")
     return {"linked": False}
+
+
+@app.get("/api/auth/config")
+async def auth_config() -> dict[str, Any]:
+    return {"google": google_auth_configured()}
+
+
+@app.get("/api/auth/google/login")
+async def google_login(http_request: Request) -> Response:
+    if not google_auth_configured():
+        raise HTTPException(status_code=503, detail="Google sign-in is not configured on this deployment.")
+    state = secrets.token_urlsafe(24)
+    response = RedirectResponse(
+        google_authorize_url(f"{public_base_url(http_request)}/api/auth/google/callback", state),
+        status_code=307,
+    )
+    response.set_cookie(
+        OAUTH_STATE_COOKIE,
+        state,
+        max_age=600,
+        httponly=True,
+        samesite="lax",
+        secure=request_is_https(http_request),
+        path="/",
+    )
+    return response
+
+
+@app.get("/api/auth/google/callback")
+async def google_callback(
+    http_request: Request,
+    code: str = Query("", max_length=4096),
+    state: str = Query("", max_length=256),
+    error: str = Query("", max_length=120),
+) -> Response:
+    if error:
+        return RedirectResponse("/?auth_error=denied", status_code=303)
+    expected_state = http_request.cookies.get(OAUTH_STATE_COOKIE)
+    if not expected_state or not state or not secrets.compare_digest(expected_state, state):
+        return RedirectResponse("/?auth_error=state", status_code=303)
+    if not google_auth_configured():
+        return RedirectResponse("/?auth_error=disabled", status_code=303)
+    try:
+        tokens = await run_in_threadpool(
+            exchange_google_code, code, f"{public_base_url(http_request)}/api/auth/google/callback"
+        )
+        claims = parse_google_id_token(tokens.get("id_token", ""))
+    except Exception:
+        return RedirectResponse("/?auth_error=google", status_code=303)
+
+    session_token = http_request.cookies.get(SESSION_COOKIE_NAME) or uuid.uuid4().hex
+    update_session(
+        session_token,
+        identity={
+            "email": claims.get("email"),
+            "name": claims.get("name") or claims.get("email"),
+            "picture": claims.get("picture"),
+            "email_verified": bool(claims.get("email_verified")),
+        },
+    )
+    response = RedirectResponse("/", status_code=303)
+    response.delete_cookie(OAUTH_STATE_COOKIE, path="/")
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        session_token,
+        max_age=ACCOUNT_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=request_is_https(http_request),
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(http_request: Request, response: Response) -> dict[str, Any]:
+    token = http_request.cookies.get(SESSION_COOKIE_NAME)
+    if token:
+        with ACCOUNT_LOCK:
+            LINKED_ACCOUNTS.pop(token, None)
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/", secure=request_is_https(http_request), httponly=True, samesite="lax")
+    return {"linked": False, "identity": None}
 
 
 def safe_filename(value: str) -> str:

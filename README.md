@@ -18,7 +18,19 @@ A visitor can link **their own** YouTube/Google account by pasting a Netscape `c
 - `POST /api/account/link` with `{"cookies": "<cookies.txt contents>"}` — keeps only youtube.com/google.com cookie lines, stores them in memory, and sets an HttpOnly session cookie for the browser.
 - `POST /api/account/unlink` — forgets the cookies for that session.
 
-Cookies are held in server memory keyed by the session cookie for `ACCOUNT_TTL_SECONDS` (default 2 hours, refreshed on use), written to a short-lived temp file only while a download runs, and never written to persistent storage. There is no Google OAuth flow: yt-dlp has no download API for one, so the cookie export is the only mechanism it can use. The user is responsible for the cookies they import — a Google session cookie grants account access, so it should only be pasted into a deployment they trust.
+Cookies are held in server memory keyed by the session cookie for `ACCOUNT_TTL_SECONDS` (default 2 hours, refreshed on use), written to a short-lived temp file only while a download runs, and never written to persistent storage. yt-dlp has no OAuth download API, so this cookie handoff is the only mechanism that can drive downloads (see Google Sign-In below, which is identity only). The user is responsible for the cookies they import — a Google session cookie grants account access, so it should only be pasted into a deployment they trust.
+
+## Google Sign-In (identity only)
+
+Optional Google sign-in shows who a visitor is (name, email, avatar) in the header, using the OpenID Connect authorization-code flow with only `openid email profile` scopes. **It does not enable downloads:** no Google OAuth scope grants access to media streams and yt-dlp cannot consume an OAuth token, so media access still comes from the account session link above. The UI states this explicitly so visitors are not misled, and the app never requests YouTube scopes it could not use.
+
+Enable it by setting:
+
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` — from a Google Cloud Console OAuth 2.0 *Web application* client.
+- Authorized redirect URI: `https://<your-host>/api/auth/google/callback` (override with `GOOGLE_REDIRECT_URI` if needed).
+- Authorized JavaScript origin: `https://<your-host>`.
+
+Endpoints: `GET /api/auth/config`, `GET /api/auth/google/login` (redirects to Google), `GET /api/auth/google/callback`, `POST /api/auth/logout`. When credentials are absent the button stays hidden and `/api/auth/google/login` returns HTTP 503. The returned ID token is checked for audience, issuer, and expiry, and the `state` parameter is matched against an HttpOnly cookie to prevent CSRF.
 
 ## Run locally
 
@@ -51,6 +63,7 @@ A Render blueprint is included in `render.yaml`. Free-tier or datacenter IP rest
 - `POST /api/download-job?url=...&type=video&quality=1080&format=mp4` — starts a background download job (same parameters as `/api/download`) and returns `{"job_id":"..."}`. The web UI uses this so long downloads never leave an HTTP request idle (which platform proxies terminate). Poll `GET /api/download-job/{job_id}` for `status` (`queued` → `working` → `done`/`error`) plus progress bytes, then save `GET /api/download-job/{job_id}/file`. Prepared files are deleted after delivery and jobs expire after 30 minutes. Jobs run one at a time by default (set `MAX_CONCURRENT_JOBS` to change); the queue rejects new jobs with HTTP 429 beyond `MAX_QUEUED_JOBS` (default 20).
 - `POST /api/extract-batch` with `{"text":"... URLs ..."}` — metadata for up to ten links.
 - `GET /api/account`, `POST /api/account/link`, `POST /api/account/unlink` — optional account linking (see above).
+- `GET /api/auth/config`, `GET /api/auth/google/login`, `GET /api/auth/google/callback`, `POST /api/auth/logout` — optional Google sign-in for identity only (see above).
 - `GET /api/network-info` and `/api/health`.
 
 Downloads are written to temporary directories and removed after the response finishes. The browser keeps recent links in its own local storage. No app account is required; account linking is optional, per browser session, and only used to authenticate the user's own downloads. Basic public-IP URL validation is applied before extraction.
