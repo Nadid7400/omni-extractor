@@ -29,13 +29,14 @@ docker build -t omni-extractor .
 docker run --rm -p 8000:8000 omni-extractor
 ```
 
-A Render blueprint is included in `render.yaml`. Free-tier or datacenter IP restrictions at media platforms still apply.
+A Render blueprint is included in `render.yaml`. Free-tier or datacenter IP restrictions at media platforms still apply. On small instances heavy downloads take minutes and run one at a time; the web UI uses the job endpoints so a long-running download never holds an HTTP request open.
 
 ## API
 
 - `GET /api/info?url=...` or `POST /api/info` with `{"url":"..."}` — title, creator, thumbnail, duration, video formats, and audio choices.
 - `GET /api/download?url=...&type=video&quality=1080&format=mp4` — video (quality may be `best`, `2160`, `1440`, `1080`, `720`, `480`, `360`, `240`, or `144`).
 - `GET /api/download?url=...&type=audio&format=mp3&bitrate=320` — MP3, M4A, FLAC, or WAV.
+- `POST /api/download-job?url=...&type=video&quality=1080&format=mp4` — starts a background download job (same parameters as `/api/download`) and returns `{"job_id":"..."}`. The web UI uses this so long downloads never leave an HTTP request idle (which platform proxies terminate). Poll `GET /api/download-job/{job_id}` for `status` (`queued` → `working` → `done`/`error`) plus progress bytes, then save `GET /api/download-job/{job_id}/file`. Prepared files are deleted after delivery and jobs expire after 30 minutes. Jobs run one at a time by default (set `MAX_CONCURRENT_JOBS` to change).
 - `POST /api/extract-batch` with `{"text":"... URLs ..."}` — metadata for up to ten links.
 - `GET /api/network-info` and `/api/health`.
 
