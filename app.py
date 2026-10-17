@@ -384,8 +384,7 @@ async def download_job_status(job_id: str) -> dict[str, Any]:
         return {field: job.get(field) for field in JOB_PUBLIC_FIELDS}
 
 
-@app.get("/api/download-job/{job_id}/file")
-async def download_job_file(job_id: str) -> FileResponse:
+def resolve_job_file(job_id: str) -> tuple[Path, str, str | None, str]:
     with JOBS_LOCK:
         job = DOWNLOAD_JOBS.get(job_id)
         if not job:
@@ -398,6 +397,12 @@ async def download_job_file(job_id: str) -> FileResponse:
         media_type = "video/mp4" if job.get("type") == "video" else "application/octet-stream"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="The prepared file is no longer available.")
+    return path, filename, tempdir, media_type
+
+
+@app.get("/api/download-job/{job_id}/file")
+async def download_job_file(job_id: str) -> FileResponse:
+    path, filename, tempdir, media_type = resolve_job_file(job_id)
 
     def _cleanup() -> None:
         if tempdir:
@@ -414,6 +419,14 @@ async def download_job_file(job_id: str) -> FileResponse:
         headers={"Cache-Control": "no-store"},
         background=BackgroundTask(_cleanup),
     )
+
+
+@app.head("/api/download-job/{job_id}/file")
+async def download_job_file_head(job_id: str) -> FileResponse:
+    # HEAD probes (download managers, scanners) get headers only and must not
+    # consume the job, so this response carries no cleanup background task.
+    path, filename, _, media_type = resolve_job_file(job_id)
+    return FileResponse(path, filename=filename, media_type=media_type, headers={"Cache-Control": "no-store"})
 
 
 def _download_sync(url: str, options: dict[str, Any]) -> None:
