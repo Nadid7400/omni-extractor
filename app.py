@@ -41,6 +41,10 @@ if not FFMPEG_LOCATION:
     except Exception:
         FFMPEG_LOCATION = None
 
+# Auto-detect supported JavaScript runtime for YouTube n-challenge and signature deciphering
+NODE_LOCATION: str | None = shutil.which("node") or ("C:\\node.exe" if os.path.isfile("C:\\node.exe") else None)
+DENO_LOCATION: str | None = shutil.which("deno") or ("/usr/local/bin/deno" if os.path.isfile("/usr/local/bin/deno") else None)
+
 # Job-based downloads: the server prepares the file in the background while the
 # browser polls. This keeps individual HTTP requests short, so long downloads do
 # not sit idle on platform proxies (which terminate them) and heavy work is
@@ -353,15 +357,25 @@ def ydl_options(extra: dict[str, Any] | None = None) -> dict[str, Any]:
         "extractor_retries": 1,
         "cachedir": False,
     }
+    # Provide JavaScript runtime (Node.js on Windows, Deno in Docker/Linux) to solve YouTube challenges
+    js_runtimes: dict[str, Any] = {}
+    if DENO_LOCATION:
+        js_runtimes["deno"] = {"path": DENO_LOCATION}
+    elif shutil.which("deno"):
+        js_runtimes["deno"] = {}
+    if NODE_LOCATION:
+        js_runtimes["node"] = {"path": NODE_LOCATION}
+    elif shutil.which("node"):
+        js_runtimes["node"] = {}
+    if js_runtimes:
+        opts["js_runtimes"] = js_runtimes
+
     raw_args = os.getenv("YTDLP_EXTRACTOR_ARGS", "")
     extractor_args = parse_extractor_args(raw_args)
     if extractor_args:
         opts["extractor_args"] = extractor_args
     elif extra and extra.get("cookiefile"):
         opts["extractor_args"] = {"youtube": {"player_client": ["web_embedded", "tv_downgraded", "web", "visionos"]}}
-    else:
-        # Default fallback for datacenter IPs (Render, AWS, GCP) where YouTube blocks web/android clients with bot challenge
-        opts["extractor_args"] = {"youtube": {"player_client": ["visionos"]}}
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
     if extra:
