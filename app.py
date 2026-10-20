@@ -360,8 +360,8 @@ def ydl_options(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     elif extra and extra.get("cookiefile"):
         opts["extractor_args"] = {"youtube": {"player_client": ["web_embedded", "tv_downgraded", "web", "visionos"]}}
     else:
-        # Default fallback for datacenter IPs (Render, AWS, GCP) where YouTube blocks web client with bot challenge
-        opts["extractor_args"] = {"youtube": {"player_client": ["visionos", "android"]}}
+        # Default fallback for datacenter IPs (Render, AWS, GCP) where YouTube blocks web/android clients with bot challenge
+        opts["extractor_args"] = {"youtube": {"player_client": ["visionos"]}}
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
     if extra:
@@ -512,7 +512,7 @@ async def _startup_event() -> None:
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "ffmpeg": bool(FFMPEG_LOCATION)}
+    return {"status": "ok", "version": "1.0.1", "ffmpeg": bool(FFMPEG_LOCATION)}
 
 
 @app.get("/api/info")
