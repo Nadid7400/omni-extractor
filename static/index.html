@@ -90,6 +90,7 @@ body{color:var(--ink);background:radial-gradient(ellipse at 50% 0%,#40101d55 0,t
 <div class="cookie-banner hidden" id="cookie-banner"><div class="cookie-content"><span>🍪 Accept cookies to enable media downloads and device streaming.</span><button class="primary cookie-btn" id="cookie-accept" type="button">Accept Cookies</button></div></div>
 </main>
 <script>
+const _fetch=window.fetch;window.fetch=(u,o={})=>{o.headers=Object.assign({'ngrok-skip-browser-warning':'1'},o.headers||{});return _fetch(u,o)};
 const $=id=>document.getElementById(id);let mode='video',media=null;
 let searchResultsData=[];
 function hasConsent(){return localStorage.getItem('omni_cookie_consent')==='1'}
