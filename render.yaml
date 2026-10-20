@@ -7,3 +7,5 @@ services:
     envVars:
       - key: PORT
         value: 8000
+      - key: KEEP_ALIVE_URL
+        value: https://omni-extractor.onrender.com

@@ -357,6 +357,11 @@ def ydl_options(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     extractor_args = parse_extractor_args(raw_args)
     if extractor_args:
         opts["extractor_args"] = extractor_args
+    elif extra and extra.get("cookiefile"):
+        opts["extractor_args"] = {"youtube": {"player_client": ["web_embedded", "tv_downgraded", "web", "visionos"]}}
+    else:
+        # Default fallback for datacenter IPs (Render, AWS, GCP) where YouTube blocks web client with bot challenge
+        opts["extractor_args"] = {"youtube": {"player_client": ["visionos", "android"]}}
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
     if extra:
@@ -473,6 +478,36 @@ class BatchRequest(BaseModel):
 
 class LinkCookiesRequest(BaseModel):
     cookies: str
+
+
+async def _keep_alive_loop() -> None:
+    """Periodic self-ping to keep cloud instances (Render, Fly, etc.) permanently awake."""
+    target_url = (
+        os.getenv("RENDER_EXTERNAL_URL")
+        or os.getenv("KEEP_ALIVE_URL")
+        or ("https://omni-extractor.onrender.com" if (os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID")) else "")
+    )
+    if not target_url:
+        return
+    ping_url = f"{target_url.rstrip('/')}/api/health"
+    await asyncio.sleep(60)  # Initial wait for server bind
+    while True:
+        try:
+            req = urllib.request.Request(
+                ping_url,
+                headers={"User-Agent": "OmniExtractor-KeepAlive/1.0"},
+            )
+            await run_in_threadpool(lambda: urllib.request.urlopen(req, timeout=15).read())
+        except Exception:
+            pass
+        await asyncio.sleep(480)  # 8 minutes interval (Render free tier idle timer is 15 minutes)
+
+
+@app.on_event("startup")
+async def _startup_event() -> None:
+    task = asyncio.create_task(_keep_alive_loop())
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
 
 
 @app.get("/api/health")

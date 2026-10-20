@@ -1,0 +1,15 @@
+name: Render Keep Alive
+
+on:
+  schedule:
+    # Run every 10 minutes to prevent Render free-tier inactivity spin-down
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping OmniExtractor Health Endpoint
+        run: |
+          curl -fsSL --max-time 30 https://omni-extractor.onrender.com/api/health || true
