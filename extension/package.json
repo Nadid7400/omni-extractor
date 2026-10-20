@@ -1,0 +1,7 @@
+{
+  "name": "omniextractor-connector",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome/Edge MV3 connector that hands the user's own YouTube session to OmniExtractor with one click."
+}

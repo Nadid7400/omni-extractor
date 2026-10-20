@@ -10,6 +10,7 @@ import re
 import secrets
 import shutil
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -22,7 +23,7 @@ from urllib.parse import urlparse
 
 import yt_dlp
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
@@ -52,6 +53,11 @@ MAX_QUEUED_JOBS = max(1, int(os.getenv("MAX_QUEUED_JOBS", "20")))
 _JOB_SLOTS = threading.Semaphore(MAX_CONCURRENT_JOBS)
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 
+# Optional quality cap for resource-constrained hosts (e.g. Render free tier).
+# Set MAX_VIDEO_HEIGHT=720 to prevent users from attempting 1080p/4K downloads
+# that will never complete within the available RAM/disk budget.
+MAX_VIDEO_HEIGHT = int(os.getenv("MAX_VIDEO_HEIGHT", "0"))  # 0 = no cap
+
 # Optional account linking. Users may supply their own YouTube/Google cookies so
 # yt-dlp downloads run as their signed-in session (YouTube is unusable from
 # datacenter IPs without one). Cookies are held in memory only, keyed by a
@@ -73,6 +79,8 @@ COOKIE_DOMAINS = (
     "google.co",
 )
 SESSION_COOKIE_NAME = "omni_session"
+SERVER_COOKIES_ENV = os.getenv("SERVER_COOKIES") or os.getenv("YTDLP_COOKIES") or ""
+SERVER_COOKIES_FILE = APP_DIR / "cookies.txt"
 
 # Google Sign-In (OpenID Connect authorization-code flow). This authenticates the
 # visitor's Google identity only: it returns an id_token for profile/email, and
@@ -225,8 +233,10 @@ def parse_google_id_token(id_token: str) -> dict[str, Any]:
 
 @contextlib.contextmanager
 def linked_cookiefile(token: str | None):
-    """Yield a temporary cookiefile for the linked session, or None when not linked."""
+    """Yield a temporary cookiefile for the linked session, or fallback to server cookies."""
     blob = account_cookie_blob(token)
+    if not blob:
+        blob, _ = get_server_cookie_blob()
     if not blob:
         yield None
         return
@@ -275,6 +285,28 @@ def validate_cookie_blob(raw: str) -> tuple[str, int]:
     return blob, len(kept)
 
 
+def get_server_cookie_blob() -> tuple[str | None, int]:
+    """Retrieve server-wide cookie blob if configured via env var or cookies.txt."""
+    raw = SERVER_COOKIES_ENV.strip()
+    if raw:
+        if not raw.startswith("#") and "\t" not in raw:
+            try:
+                raw = base64.b64decode(raw).decode("utf-8")
+            except Exception:
+                pass
+        try:
+            return validate_cookie_blob(raw)
+        except Exception:
+            return raw, 1
+    if SERVER_COOKIES_FILE.is_file():
+        try:
+            text = SERVER_COOKIES_FILE.read_text(encoding="utf-8")
+            return validate_cookie_blob(text)
+        except Exception:
+            pass
+    return None, 0
+
+
 def validate_public_url(raw_url: str) -> str:
     """Basic SSRF guard. Only public HTTP(S) URLs are accepted."""
     try:
@@ -321,7 +353,8 @@ def ydl_options(extra: dict[str, Any] | None = None) -> dict[str, Any]:
         "extractor_retries": 1,
         "cachedir": False,
     }
-    extractor_args = parse_extractor_args(os.getenv("YTDLP_EXTRACTOR_ARGS", ""))
+    raw_args = os.getenv("YTDLP_EXTRACTOR_ARGS", "")
+    extractor_args = parse_extractor_args(raw_args)
     if extractor_args:
         opts["extractor_args"] = extractor_args
     if FFMPEG_LOCATION:
@@ -333,13 +366,14 @@ def ydl_options(extra: dict[str, Any] | None = None) -> dict[str, Any]:
 
 def clean_metadata(info: dict[str, Any]) -> dict[str, Any]:
     formats: list[dict[str, Any]] = []
-    seen: set[int] = set()
     for item in info.get("formats") or []:
         height = item.get("height")
         if not height or item.get("vcodec") == "none":
             continue
         height = int(height)
-        # One representative format per height; use the best bitrate/size estimate.
+        if MAX_VIDEO_HEIGHT and height > MAX_VIDEO_HEIGHT:
+            continue
+        # One representative format per height; prefer H.264 (avc1) for maximum device compatibility
         existing = next((f for f in formats if f["height"] == height), None)
         size = item.get("filesize") or item.get("filesize_approx")
         candidate = {
@@ -351,9 +385,13 @@ def clean_metadata(info: dict[str, Any]) -> dict[str, Any]:
             "fps": item.get("fps"),
             "vcodec": item.get("vcodec"),
         }
+        is_avc = str(candidate.get("vcodec", "")).startswith("avc1")
+        existing_is_avc = str(existing.get("vcodec", "")).startswith("avc1") if existing else False
         if existing is None:
             formats.append(candidate)
-        elif size and (not existing.get("filesize") or size > existing["filesize"]):
+        elif is_avc and not existing_is_avc:
+            formats[formats.index(existing)] = candidate
+        elif (not existing_is_avc or is_avc) and size and (not existing.get("filesize") or size > existing["filesize"]):
             formats[formats.index(existing)] = candidate
     formats.sort(key=lambda f: f["height"], reverse=True)
     return {
@@ -383,6 +421,46 @@ def extract_info(raw_url: str, cookiefile: str | None = None) -> dict[str, Any]:
         if not info:
             raise RuntimeError("No media information was returned.")
         return clean_metadata(info)
+
+
+def search_youtube(query: str, limit: int = 10, cookiefile: str | None = None) -> list[dict[str, Any]]:
+    """Search YouTube videos and return metadata without downloading."""
+    clean_query = query.strip()
+    if not clean_query:
+        return []
+    search_term = f"ytsearch{limit}:{clean_query}"
+    extra: dict[str, Any] = {"extract_flat": True, "quiet": True, "no_warnings": True}
+    if cookiefile:
+        extra["cookiefile"] = cookiefile
+    with yt_dlp.YoutubeDL(ydl_options(extra)) as ydl:
+        res = ydl.extract_info(search_term, download=False)
+        if not res:
+            return []
+        entries = res.get("entries") or []
+        results: list[dict[str, Any]] = []
+        for e in entries:
+            if not e:
+                continue
+            video_id = e.get("id")
+            url = e.get("url")
+            if video_id and (not url or not str(url).startswith("http")):
+                url = f"https://www.youtube.com/watch?v={video_id}"
+            thumbs = e.get("thumbnails") or []
+            thumb_url = None
+            if thumbs:
+                thumb_url = thumbs[-1].get("url")
+            if not thumb_url and video_id:
+                thumb_url = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
+            results.append({
+                "id": video_id,
+                "url": url,
+                "title": e.get("title") or "Untitled",
+                "uploader": e.get("uploader") or e.get("channel") or "YouTube",
+                "duration": e.get("duration"),
+                "view_count": e.get("view_count"),
+                "thumbnail": thumb_url,
+            })
+        return results
 
 
 class InfoRequest(BaseModel):
@@ -420,17 +498,36 @@ async def info_post(http_request: Request, payload: InfoRequest) -> dict[str, An
     return await info_get(http_request, payload.url)
 
 
+@app.get("/api/search")
+async def search_endpoint(
+    http_request: Request,
+    q: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(10, ge=1, le=25),
+) -> dict[str, Any]:
+    """Search YouTube videos and return metadata options."""
+    token = http_request.cookies.get(SESSION_COOKIE_NAME)
+    try:
+        with linked_cookiefile(token) as cookiefile:
+            items = await run_in_threadpool(search_youtube, q, limit, cookiefile)
+            return {"query": q, "results": items, "count": len(items)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"YouTube search failed: {str(exc)[:200]}")
+
+
 @app.get("/api/account")
 async def account_info(http_request: Request) -> dict[str, Any]:
     _account_sweep()
     token = http_request.cookies.get(SESSION_COOKIE_NAME)
     session = get_session(token)
-    if not session:
-        return {"linked": False, "identity": None, "google": google_auth_configured()}
+    server_blob, server_entries = get_server_cookie_blob()
+    user_cookies = bool(session and session.get("cookies"))
+    linked = user_cookies or bool(server_blob)
+    entries = (session.get("entries") if user_cookies else server_entries) or 0
     return {
-        "linked": bool(session.get("cookies")),
-        "entries": session.get("entries") or 0,
-        "identity": session.get("identity"),
+        "linked": linked,
+        "server_managed": bool(server_blob and not user_cookies),
+        "entries": entries,
+        "identity": session.get("identity") if session else None,
         "expires_in": ACCOUNT_TTL_SECONDS,
         "google": google_auth_configured(),
     }
@@ -592,11 +689,16 @@ def build_download_options(
     if cookiefile:
         options["cookiefile"] = cookiefile
     if type == "video":
+        # Apply quality cap if set (e.g. MAX_VIDEO_HEIGHT=720 on Render free tier).
+        if MAX_VIDEO_HEIGHT and quality == "best":
+            quality = str(MAX_VIDEO_HEIGHT)
         if quality == "best":
-            options["format"] = "bestvideo+bestaudio/best"
+            # Prefer pre-merged single-file formats first to avoid 3× disk usage
+            # from downloading separate video + audio streams then FFmpeg-merging.
+            options["format"] = "best/bestvideo+bestaudio"
         else:
             max_height = int(quality)
-            options["format"] = f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
+            options["format"] = f"best[height<={max_height}]/bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]"
         options["merge_output_format"] = "mp4"
     else:
         options["format"] = "bestaudio/best"
@@ -758,8 +860,9 @@ def resolve_job_file(job_id: str) -> tuple[Path, str, str | None, str]:
 
 
 @app.get("/api/download-job/{job_id}/file")
-async def download_job_file(job_id: str) -> FileResponse:
+async def download_job_file(job_id: str) -> Response:
     path, filename, tempdir, media_type = resolve_job_file(job_id)
+    file_size = path.stat().st_size
 
     def _cleanup() -> None:
         if tempdir:
@@ -769,12 +872,25 @@ async def download_job_file(job_id: str) -> FileResponse:
         with JOBS_LOCK:
             DOWNLOAD_JOBS.pop(job_id, None)
 
-    return FileResponse(
-        path,
-        filename=filename,
+    # Stream in 256 KB chunks so bytes keep flowing and Render's proxy
+    # (which kills connections idle for ~100 s) does not terminate the transfer.
+    async def _stream():
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(256 * 1024):
+                    yield chunk
+        finally:
+            _cleanup()
+
+    encoded = urllib.parse.quote(filename, safe="")
+    return StreamingResponse(
+        _stream(),
         media_type=media_type,
-        headers={"Cache-Control": "no-store"},
-        background=BackgroundTask(_cleanup),
+        headers={
+            "Content-Length": str(file_size),
+            "Content-Disposition": f'attachment; filename="{encoded}"; filename*=UTF-8\'\'{encoded}',
+            "Cache-Control": "no-store",
+        },
     )
 
 
@@ -789,6 +905,303 @@ async def download_job_file_head(job_id: str) -> FileResponse:
 def _download_sync(url: str, options: dict[str, Any]) -> None:
     with yt_dlp.YoutubeDL(ydl_options(options)) as ydl:
         ydl.download([url])
+
+
+def make_content_disposition(name: str, ext: str) -> str:
+    """Generate RFC 6266 compliant Content-Disposition with clean ASCII fallback for Android/iOS."""
+    ascii_clean = re.sub(r'[^a-zA-Z0-9_\-\. ]+', ' ', name).strip()
+    ascii_clean = re.sub(r'\s+', ' ', ascii_clean) or "media"
+    ascii_filename = f"{ascii_clean[:80]}.{ext}"
+    utf8_name = urllib.parse.quote(f"{name[:120]}.{ext}")
+    return f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{utf8_name}'
+
+
+def _extract_stream_url(
+    url: str,
+    type: str,
+    quality: str,
+    format: str,
+    cookiefile: str | None = None,
+) -> tuple[str, dict[str, str], str | None, dict[str, str], str, str, bool]:
+    """Extract the direct media URL without downloading the file."""
+    opts: dict[str, Any] = {}
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+    if type == "video":
+        effective_q = quality
+        if MAX_VIDEO_HEIGHT and effective_q == "best":
+            effective_q = str(MAX_VIDEO_HEIGHT)
+        # Prioritize H.264 (avc1/h264) + AAC (mp4a), universally hardware-decoded on 100% of Windows PCs, Macs, iPhones, and Androids without black screens.
+        if effective_q == "best":
+            opts["format"] = (
+                "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+                "bestvideo[vcodec^=avc1]+bestaudio/"
+                "bestvideo[vcodec^=h264]+bestaudio/"
+                "best[vcodec^=avc1]/"
+                "best[vcodec^=h264]/"
+                "bestvideo[vcodec^=vp9]+bestaudio/"
+                "bestvideo[vcodec^=vp09]+bestaudio/"
+                "bestvideo+bestaudio/best"
+            )
+        else:
+            h = int(effective_q)
+            if h > 1080:
+                # 1440p (2K) and 2160p (4K): prefer VP9 (natively supported by Windows/Android) over AV1
+                opts["format"] = (
+                    f"bestvideo[height<={h}][vcodec^=vp9]+bestaudio/"
+                    f"bestvideo[height<={h}][vcodec^=vp09]+bestaudio/"
+                    f"bestvideo[height<={h}]+bestaudio/best"
+                )
+            else:
+                # <= 1080p: strictly prioritize H.264 (avc1) for 100% media player compatibility
+                opts["format"] = (
+                    f"bestvideo[height<={h}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+                    f"bestvideo[height<={h}][vcodec^=avc1]+bestaudio/"
+                    f"bestvideo[height<={h}][vcodec^=h264]+bestaudio/"
+                    f"bestvideo[height<={h}]+bestaudio/"
+                    f"best[height<={h}]/"
+                    f"bestvideo+bestaudio/best"
+                )
+    else:
+        opts["format"] = "bestaudio[acodec^=mp4a]/bestaudio/best"
+    with yt_dlp.YoutubeDL(ydl_options(opts)) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if not info:
+            raise RuntimeError("No media information returned.")
+    protocol = str(info.get("protocol") or "")
+    direct = info.get("url")
+    direct_headers = info.get("http_headers") or {}
+    audio_url = None
+    audio_headers = {}
+    if not direct:
+        rf = info.get("requested_formats")
+        if rf and len(rf) >= 2:
+            direct = rf[0].get("url")
+            direct_headers = rf[0].get("http_headers") or {}
+            audio_url = rf[1].get("url")
+            audio_headers = rf[1].get("http_headers") or {}
+            protocol = str(rf[0].get("protocol") or protocol)
+        elif rf and len(rf) == 1:
+            direct = rf[0].get("url")
+            direct_headers = rf[0].get("http_headers") or {}
+            protocol = str(rf[0].get("protocol") or protocol)
+    if not direct:
+        raise RuntimeError("No streamable URL found for this media.")
+    is_manifest = bool(
+        any(m in protocol.lower() for m in ("m3u8", "dash"))
+        or ".m3u8" in direct.lower()
+        or ".mpd" in direct.lower()
+    )
+    return (
+        direct,
+        direct_headers,
+        audio_url,
+        audio_headers,
+        info.get("title") or "media",
+        info.get("ext") or ("mp4" if type == "video" else format),
+        is_manifest,
+    )
+
+
+def _stream_error_page(message: str) -> Response:
+    """Return a tiny HTML page that notifies the parent frame of the error."""
+    escaped = json.dumps(message[:240])
+    html = (
+        "<html><body><script>"
+        f"window.parent.postMessage({{source:'omni-extractor',type:'download-error',error:{escaped}}},'*');"
+        "</script></body></html>"
+    )
+    return Response(content=html, media_type="text/html")
+
+
+@app.get("/api/stream-download")
+async def stream_download(
+    http_request: Request,
+    url: str = Query(..., min_length=8, max_length=2048),
+    type: str = Query("video", pattern="^(video|audio)$"),
+    quality: str = Query("best", max_length=8),
+    format: str = Query("mp3", pattern="^(mp3|m4a|flac|wav|mp4)$"),
+    bitrate: int = Query(320, ge=64, le=320),
+    title: str | None = Query(None, max_length=180),
+) -> Response:
+    """Stream media directly to the client without storing on server disk."""
+    try:
+        safe_url = validate_public_url(url)
+        validate_download_args(type, quality, format)
+    except HTTPException as exc:
+        return _stream_error_page(exc.detail)
+
+    token = http_request.cookies.get(SESSION_COOKIE_NAME)
+    try:
+        with linked_cookiefile(token) as cookiefile:
+            direct_url, http_headers, audio_url, audio_headers, media_title, src_ext, is_manifest = await run_in_threadpool(
+                _extract_stream_url, safe_url, type, quality, format, cookiefile
+            )
+    except Exception as exc:
+        return _stream_error_page(f"Could not extract media: {str(exc)[:200]}")
+
+    final_name = safe_filename(title or media_title)
+
+    if type == "video":
+        if (audio_url or is_manifest) and FFMPEG_LOCATION:
+            # Video + Audio are separate adaptive streams OR HLS/DASH manifest: live-mux via FFmpeg to client (zero disk)
+            v_h = "".join(f"{k}: {v}\r\n" for k, v in http_headers.items())
+            cmd = [FFMPEG_LOCATION, "-hide_banner", "-loglevel", "error"]
+            if v_h:
+                cmd += ["-headers", v_h]
+            cmd += ["-i", direct_url]
+            if audio_url:
+                a_h = "".join(f"{k}: {v}\r\n" for k, v in audio_headers.items())
+                if a_h:
+                    cmd += ["-headers", a_h]
+                cmd += ["-i", audio_url]
+            cmd += [
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                "-f", "mp4",
+                "-y", "pipe:1",
+            ]
+            try:
+                proc = await run_in_threadpool(
+                    lambda: subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                )
+            except Exception as exc:
+                return _stream_error_page(f"Could not start video multiplexing: {str(exc)[:200]}")
+
+            async def _video_mux_pipe():
+                try:
+                    while True:
+                        chunk = await run_in_threadpool(proc.stdout.read, 256 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+                finally:
+                    proc.stdout.close()
+                    proc.wait()
+
+            return StreamingResponse(
+                _video_mux_pipe(),
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": make_content_disposition(final_name, "mp4"),
+                    "Cache-Control": "no-store",
+                },
+            )
+        else:
+            # Single pre-merged stream: direct proxy-stream via urllib
+            try:
+                req = urllib.request.Request(direct_url, headers=http_headers)
+                source = await run_in_threadpool(lambda: urllib.request.urlopen(req, timeout=60))
+            except Exception as exc:
+                return _stream_error_page(f"Could not connect to media source: {str(exc)[:200]}")
+
+            ctype = str(source.headers.get("Content-Type", "")).lower()
+            if any(m in ctype for m in ("mpegurl", "m3u8", "dash+xml")) and FFMPEG_LOCATION:
+                source.close()
+                v_h = "".join(f"{k}: {v}\r\n" for k, v in http_headers.items())
+                cmd = [FFMPEG_LOCATION, "-hide_banner", "-loglevel", "error"]
+                if v_h:
+                    cmd += ["-headers", v_h]
+                cmd += [
+                    "-i", direct_url,
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                    "-f", "mp4",
+                    "-y", "pipe:1",
+                ]
+                proc = await run_in_threadpool(
+                    lambda: subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                )
+                async def _video_mux_pipe_fb():
+                    try:
+                        while True:
+                            chunk = await run_in_threadpool(proc.stdout.read, 256 * 1024)
+                            if not chunk:
+                                break
+                            yield chunk
+                    finally:
+                        proc.stdout.close()
+                        proc.wait()
+
+                return StreamingResponse(
+                    _video_mux_pipe_fb(),
+                    media_type="video/mp4",
+                    headers={
+                        "Content-Disposition": make_content_disposition(final_name, "mp4"),
+                        "Cache-Control": "no-store",
+                    },
+                )
+
+            content_length = source.headers.get("Content-Length")
+
+            async def _video_pipe():
+                try:
+                    while True:
+                        chunk = await run_in_threadpool(source.read, 256 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+                finally:
+                    source.close()
+
+            headers: dict[str, str] = {
+                "Content-Disposition": make_content_disposition(final_name, src_ext),
+                "Cache-Control": "no-store",
+            }
+            if content_length:
+                headers["Content-Length"] = content_length
+            return StreamingResponse(_video_pipe(), media_type="video/mp4", headers=headers)
+
+    else:
+        # Audio: pipe source URL through FFmpeg for format conversion (zero disk)
+        if not FFMPEG_LOCATION:
+            return _stream_error_page("FFmpeg is required for audio conversion but is not installed.")
+
+        codec_map: dict[str, list[str]] = {
+            "mp3": ["-codec:a", "libmp3lame", "-b:a", f"{bitrate}k", "-f", "mp3"],
+            "m4a": ["-codec:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-f", "ipod"],
+            "flac": ["-codec:a", "flac", "-f", "flac"],
+            "wav": ["-codec:a", "pcm_s16le", "-f", "wav"],
+        }
+        codec_args = codec_map.get(format, codec_map["mp3"])
+
+        # Pass the required HTTP headers so FFmpeg can fetch from the CDN
+        headers_str = "".join(f"{k}: {v}\r\n" for k, v in http_headers.items())
+        cmd = [FFMPEG_LOCATION, "-hide_banner", "-loglevel", "error"]
+        if headers_str:
+            cmd += ["-headers", headers_str]
+        cmd += ["-i", direct_url, "-vn", *codec_args, "-y", "pipe:1"]
+
+        try:
+            proc = await run_in_threadpool(
+                lambda: subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            )
+        except Exception as exc:
+            return _stream_error_page(f"Could not start audio conversion: {str(exc)[:200]}")
+
+        async def _audio_pipe():
+            try:
+                while True:
+                    chunk = await run_in_threadpool(proc.stdout.read, 256 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                proc.stdout.close()
+                proc.wait()
+
+        ext_clean = format.lower()
+        mime_map = {"mp3": "audio/mpeg", "m4a": "audio/mp4", "flac": "audio/flac", "wav": "audio/wav"}
+        return StreamingResponse(
+            _audio_pipe(),
+            media_type=mime_map.get(format, "application/octet-stream"),
+            headers={
+                "Content-Disposition": make_content_disposition(final_name, ext_clean),
+                "Cache-Control": "no-store",
+            },
+        )
 
 
 @app.post("/api/extract-batch")

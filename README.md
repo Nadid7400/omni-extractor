@@ -12,13 +12,21 @@ YouTube extraction (and some other sites) uses a JavaScript runtime; the Docker 
 
 ## Optional account linking
 
-A visitor can link **their own** YouTube/Google account by pasting a Netscape `cookies.txt` export (e.g. from the "Get cookies.txt LOCALLY" browser extension). The server then passes those cookies to yt-dlp, so downloads run as that visitor's signed-in session.
+A visitor can link **their own** YouTube/Google account by pasting a Netscape `cookies.txt` export (e.g. from the "Get cookies.txt LOCALLY" browser extension), or with one click using the connector extension below. The server then passes those cookies to yt-dlp, so downloads run as that visitor's signed-in session.
 
 - `GET /api/account` — `{"linked": false}` or `{"linked": true, "entries": <n>, "expires_in": <seconds>}`.
 - `POST /api/account/link` with `{"cookies": "<cookies.txt contents>"}` — keeps only youtube.com/google.com cookie lines, stores them in memory, and sets an HttpOnly session cookie for the browser.
 - `POST /api/account/unlink` — forgets the cookies for that session.
 
 Cookies are held in server memory keyed by the session cookie for `ACCOUNT_TTL_SECONDS` (default 2 hours, refreshed on use), written to a short-lived temp file only while a download runs, and never written to persistent storage. yt-dlp has no OAuth download API, so this cookie handoff is the only mechanism that can drive downloads (see Google Sign-In below, which is identity only). The user is responsible for the cookies they import — a Google session cookie grants account access, so it should only be pasted into a deployment they trust.
+
+## One-click connector extension
+
+`extension/` is a Chromium (MV3) extension that removes the manual export. While the user is signed in to YouTube in their browser, the app's "Connect with extension" button asks the extension for the session; the extension reads cookies with the `chrome.cookies` API (the reliable way to reach HttpOnly session cookies), hands the netscape blob to the page, and the page posts it to `/api/account/link` from the app's own origin. No copy/paste, and the request path stays first-party.
+
+Install for development: open `chrome://extensions`, enable Developer mode, choose "Load unpacked", and select the `extension/` folder. Then open the app and click "Connect with extension".
+
+For public users the extension must be published (Chrome Web Store) or installed manually — "Load unpacked" is a developer-only path. Package it with `Compress-Archive -Path extension\* -DestinationPath omni-connector.zip` (Windows) or `zip -r omni-connector.zip extension` (Unix). To target another host, update the `matches` in `extension/manifest.json` and `ALLOWED_ORIGINS` in `extension/background.js`.
 
 ## Google Sign-In (identity only)
 

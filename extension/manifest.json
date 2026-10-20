@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "OmniExtractor YouTube Connector",
+  "version": "1.0.0",
+  "description": "Sends your own YouTube session to OmniExtractor so it can download videos as you. One click, no copy/paste.",
+  "permissions": ["cookies"],
+  "host_permissions": [
+    "https://youtube.com/*",
+    "https://*.youtube.com/*",
+    "https://google.com/*",
+    "https://*.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://omni-extractor.onrender.com/*",
+        "http://localhost/*",
+        "http://127.0.0.1/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
