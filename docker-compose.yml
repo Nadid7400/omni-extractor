@@ -1,0 +1,11 @@
+services:
+  omni-extractor:
+    build: .
+    container_name: omni-extractor
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - MAX_CONCURRENT_JOBS=4
+      - MAX_QUEUED_JOBS=30
